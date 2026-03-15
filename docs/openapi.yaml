@@ -1,0 +1,186 @@
+openapi: 3.0.3
+info:
+  title: israelalerts API
+  description: |
+    Real-time and historical Israeli emergency alerts from the Tzofar WebSocket feed.
+    Data is collected by a persistent listener on EC2 (il-central-1) and exposed
+    via AWS API Gateway + Lambda proxy.
+  version: 1.0.0
+  contact:
+    name: panealy/israelalerts
+    url: https://github.com/panealy/israelalerts
+
+servers:
+  - url: https://igzzaecey6.execute-api.il-central-1.amazonaws.com/default/tzofar-proxy
+    description: Production (AWS il-central-1)
+
+paths:
+  /status:
+    get:
+      summary: WebSocket connection health
+      description: Returns the current status of the Tzofar WebSocket connection on the EC2 listener.
+      operationId: getStatus
+      responses:
+        "200":
+          description: Connection status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Status"
+              example:
+                connected: true
+                last_message: "2026-03-15T17:37:43.427Z"
+                connect_time: "2026-03-15T17:37:48.467Z"
+                reconnects: 73
+
+  /alerts:
+    get:
+      summary: List alerts
+      description: |
+        Returns stored alert messages, newest first. Supports filtering by threat type,
+        time range, and pagination.
+      operationId: getAlerts
+      parameters:
+        - name: limit
+          in: query
+          description: Maximum number of alerts to return (default 100, max 1000)
+          schema:
+            type: integer
+            default: 100
+            minimum: 1
+            maximum: 1000
+        - name: offset
+          in: query
+          description: Number of alerts to skip for pagination
+          schema:
+            type: integer
+            default: 0
+            minimum: 0
+        - name: threat
+          in: query
+          description: Filter by threat type (see threat type table)
+          schema:
+            type: integer
+            enum: [0, 1, 2, 3, 4, 5, 6, 7, 8]
+        - name: since
+          in: query
+          description: Return only alerts received at or after this ISO-8601 UTC timestamp
+          schema:
+            type: string
+            format: date-time
+            example: "2026-01-15T00:00:00Z"
+      responses:
+        "200":
+          description: List of alerts
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AlertList"
+
+  /alerts/latest:
+    get:
+      summary: Latest alert
+      description: Returns the single most recently received alert message.
+      operationId: getLatestAlert
+      responses:
+        "200":
+          description: Most recent alert, or null if no alerts have been received yet
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Alert"
+
+components:
+  schemas:
+
+    Status:
+      type: object
+      properties:
+        connected:
+          type: boolean
+          description: Whether the WebSocket is currently connected to Tzofar
+        last_message:
+          type: string
+          format: date-time
+          nullable: true
+          description: ISO-8601 UTC timestamp of the last received message
+        connect_time:
+          type: string
+          format: date-time
+          nullable: true
+          description: ISO-8601 UTC timestamp when the current connection was established
+        reconnects:
+          type: integer
+          description: Total number of reconnection attempts since service start
+
+    AlertList:
+      type: object
+      properties:
+        count:
+          type: integer
+          description: Number of alerts returned in this response
+        alerts:
+          type: array
+          items:
+            $ref: "#/components/schemas/Alert"
+
+    Alert:
+      type: object
+      description: |
+        A Tzofar WebSocket message. The schema matches Tzofar's payload exactly,
+        with `received_at` added as the only extra field.
+        Common types: ALERT (active siren), UPDATE (status update), SYSTEM_MESSAGE.
+      properties:
+        type:
+          type: string
+          description: Message type from Tzofar
+          example: ALERT
+          enum:
+            - ALERT
+            - UPDATE
+            - SYSTEM_MESSAGE
+        time:
+          type: integer
+          format: int64
+          nullable: true
+          description: Unix timestamp of the alert event
+          example: 1773423099
+        threat:
+          type: integer
+          nullable: true
+          description: Threat category (see threat type table below)
+          example: 0
+        isDrill:
+          type: boolean
+          nullable: true
+          description: Whether this is a drill alert
+          example: false
+        cities:
+          type: array
+          nullable: true
+          description: List of city/area names affected (in Hebrew)
+          items:
+            type: string
+          example: ["תל אביב - דרום העיר ויפו", "בת ים"]
+        data:
+          type: object
+          nullable: true
+          description: Additional payload data (varies by message type)
+        received_at:
+          type: string
+          format: date-time
+          description: ISO-8601 UTC timestamp when this message was received by the listener
+          example: "2026-03-15T14:31:39.123Z"
+      additionalProperties: true
+      x-threat-types:
+        description: Threat type reference
+        values:
+          0: Rockets / missiles (Red Alert)
+          1: Unconventional missile
+          2: Earthquake
+          3: Tsunami
+          4: Hostile aircraft / UAV infiltration
+          5: Terrorist infiltration
+          6: Hazardous materials incident
+          7: Radiological incident
+          8: Safe to leave shelter (all-clear)

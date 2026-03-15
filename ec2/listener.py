@@ -63,7 +63,7 @@ def init_db() -> sqlite3.Connection:
 
 # Thread-safe DB connection (created once, shared via lock)
 _db_lock = threading.Lock()
-_db: sqlite3.Connection | None = None
+_db = None  # sqlite3.Connection or None
 
 def get_db() -> sqlite3.Connection:
     global _db

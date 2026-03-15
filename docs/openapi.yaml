@@ -127,9 +127,16 @@ components:
     Alert:
       type: object
       description: |
-        A Tzofar WebSocket message. The schema matches Tzofar's payload exactly,
-        with `received_at` added as the only extra field.
-        Common types: ALERT (active siren), UPDATE (status update), SYSTEM_MESSAGE.
+        A Tzofar WebSocket message, with `received_at` added by the listener.
+
+        **Important:** The schema differs by `type`:
+
+        - `ALERT` — active siren. Alert details (`threat`, `isDrill`, `cities`, `time`)
+          are nested inside the `data` object.
+        - `SYSTEM_MESSAGE` — informational update from Home Front Command (e.g. incident
+          ended). Fields like `titleEn`, `bodyEn`, `time` are top-level inside `data`,
+          alongside multilingual variants (`titleHe`, `titleAr`, `titleRu` etc.).
+        - `UPDATE` — status update, similar structure to SYSTEM_MESSAGE.
       properties:
         type:
           type: string
@@ -139,41 +146,94 @@ components:
             - ALERT
             - UPDATE
             - SYSTEM_MESSAGE
-        time:
-          type: integer
-          format: int64
-          nullable: true
-          description: Unix timestamp of the alert event
-          example: 1773423099
-        threat:
-          type: integer
-          nullable: true
-          description: Threat category (see threat type table below)
-          example: 0
-        isDrill:
-          type: boolean
-          nullable: true
-          description: Whether this is a drill alert
-          example: false
-        cities:
-          type: array
-          nullable: true
-          description: List of city/area names affected (in Hebrew)
-          items:
-            type: string
-          example: ["תל אביב - דרום העיר ויפו", "בת ים"]
         data:
           type: object
-          nullable: true
-          description: Additional payload data (varies by message type)
+          description: |
+            Payload — structure varies by `type`.
+
+            For `ALERT`:
+            ```json
+            {
+              "notificationId": "2466caa5-2f52-4c14-baf1-4b37002ae324",
+              "time": 1773594368,
+              "threat": 5,
+              "isDrill": false,
+              "cities": ["שומרה"],
+              "citiesIds": [1234],
+              "instructionType": 1,
+              "pinUntil": null,
+              "areasIds": [6],
+              "instructionReadingDescName": "9"
+            }
+            ```
+
+            For `SYSTEM_MESSAGE` / `UPDATE`:
+            ```json
+            {
+              "id": 821,
+              "time": 1773595110,
+              "titleHe": "...",
+              "titleEn": "Home Front Command - Incident Ended",
+              "titleAr": "...",
+              "titleRu": "...",
+              "titleEs": "...",
+              "bodyHe": "...",
+              "bodyEn": "The incident has ended at Ramot Naftali",
+              "bodyAr": "...",
+              "bodyRu": "...",
+              "bodyEs": "...",
+              "forIos": true,
+              "forAndroid": true,
+              "display": true,
+              "instruction": false,
+              "areasIds": [6],
+              "citiesIds": [1605]
+            }
+            ```
+          properties:
+            notificationId:
+              type: string
+              description: (ALERT only) Unique notification ID
+            time:
+              type: integer
+              format: int64
+              description: Unix timestamp of the event
+            threat:
+              type: integer
+              description: (ALERT only) Threat category — see threat type table
+            isDrill:
+              type: boolean
+              description: (ALERT only) Whether this is a drill
+            cities:
+              type: array
+              description: (ALERT only) Affected city/area names in Hebrew
+              items:
+                type: string
+            citiesIds:
+              type: array
+              description: Numeric city IDs
+              items:
+                type: integer
+            areasIds:
+              type: array
+              description: Numeric area IDs
+              items:
+                type: integer
+            titleEn:
+              type: string
+              description: (SYSTEM_MESSAGE/UPDATE only) English title
+            bodyEn:
+              type: string
+              description: (SYSTEM_MESSAGE/UPDATE only) English body text
+          additionalProperties: true
         received_at:
           type: string
           format: date-time
-          description: ISO-8601 UTC timestamp when this message was received by the listener
+          description: ISO-8601 UTC timestamp when the listener received this message
           example: "2026-03-15T14:31:39.123Z"
       additionalProperties: true
       x-threat-types:
-        description: Threat type reference
+        description: Threat type reference (used in data.threat for ALERT messages)
         values:
           0: Rockets / missiles (Red Alert)
           1: Unconventional missile

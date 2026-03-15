@@ -3,14 +3,23 @@ import os
 import urllib.request
 import urllib.parse
 
-VM_BASE_URL = os.environ["VM_BASE_URL"]   # e.g. http://10.0.1.42:8080
-API_TOKEN   = os.environ["API_TOKEN"]     # shared secret with EC2 service
+VM_BASE_URL  = os.environ["VM_BASE_URL"]
+API_TOKEN    = os.environ["API_TOKEN"]
+ROUTE_PREFIX = "/default/tzofar-proxy"
 
 def lambda_handler(event, context):
     qs_params = event.get("queryStringParameters") or {}
-    path      = event.get("rawPath", "/alerts")
+    raw_path  = event.get("rawPath", "/alerts")
 
-    # Build forwarded URL preserving query string
+    path = raw_path
+    if path.startswith(ROUTE_PREFIX):
+        path = path[len(ROUTE_PREFIX):]
+
+    if not path or path == "/":
+        path = "/alerts"
+    if path != "/" and path.endswith("/"):
+        path = path.rstrip("/")
+
     if qs_params:
         path = path + "?" + urllib.parse.urlencode(qs_params)
 

@@ -133,9 +133,14 @@ components:
 
         - `ALERT` — active siren. Alert details (`threat`, `isDrill`, `cities`, `time`)
           are nested inside the `data` object.
-        - `SYSTEM_MESSAGE` — informational update from Home Front Command (e.g. incident
-          ended). Fields like `titleEn`, `bodyEn`, `time` are top-level inside `data`,
-          alongside multilingual variants (`titleHe`, `titleAr`, `titleRu` etc.).
+        - `SYSTEM_MESSAGE` — used for two distinct subtypes, distinguished by the Hebrew
+          body text in `data.bodyHe`:
+            - **Early warning** (pre-alert): body contains `"בדקות הקרובות ייתכן ויופעלו התרעות"`
+              ("In the coming minutes, alerts may be activated"). This is the closest
+              Tzofar gets to a pre-alert — it is a SYSTEM_MESSAGE, not a separate type.
+            - **Exit / all-clear**: body contains `"האירוע הסתיים"` ("The incident has ended").
+          Fields like `titleEn`, `bodyEn`, `time` are inside `data`, alongside multilingual
+          variants (`titleHe`, `titleAr`, `titleRu`, `titleEs`).
         - `UPDATE` — status update, similar structure to SYSTEM_MESSAGE.
       properties:
         type:

@@ -11,7 +11,7 @@ info:
     url: https://github.com/panealy/israelalerts
 
 servers:
-  - url: https://igzzaecey6.execute-api.il-central-1.amazonaws.com/default/tzofar-proxy
+  - url: https://YOUR_API_GATEWAY_URL
     description: Production (AWS il-central-1)
 
 paths:

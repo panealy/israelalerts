@@ -1,48 +1,53 @@
 # israelalerts
 
-Persistent Israeli alert listener based on the [Tzofar](https://www.tzevaadom.co.il) WebSocket feed.
+Persistent Israeli emergency alert listener based on the [Tzofar](https://www.tzevaadom.co.il)
+WebSocket feed. Collects all alert messages in real time, stores them to SQLite, and exposes
+a public HTTPS API from outside Israel.
+
+## Live endpoint
+
+```
+https://YOUR_API_GATEWAY_URL
+```
+
+See `docs/openapi.yaml` for the full API spec, or paste it at [editor.swagger.io](https://editor.swagger.io)
+for an interactive browser UI.
 
 ## Architecture
 
 ```
 Tzofar WebSocket (wss://ws.tzevaadom.co.il)
         ↓
-EC2 t4g.nano — il-central-1 (private subnet)
-  ec2/listener.py — stores to SQLite, exposes HTTP API on :8080
+EC2 t4g.nano — il-central-1 (Amazon Linux 2023, ARM64)
+  ec2/listener.py — stores to SQLite, HTTP API on :8080 (private)
+        ↑  VPC private IP
+Lambda (il-central-1, same VPC)
+  lambda/handler.py — strips API Gateway prefix, proxies to EC2
         ↑
-Lambda — il-central-1 (same VPC)
-  lambda/handler.py — public HTTPS proxy via Function URL
+API Gateway HTTP API (il-central-1)
         ↑
-Your external caller
+Public HTTPS endpoint
 ```
 
-## Components
+**Note:** AWS Lambda Function URLs are not available in `il-central-1`. API Gateway
+HTTP API is used instead as the public entry point.
 
-### `ec2/listener.py`
+## API endpoints
 
-Connects to Tzofar's WebSocket, stores every message to SQLite, and
-exposes an HTTP API on port 8080. Runs as a systemd service.
-
-**Endpoints** (all require `X-API-Token` header):
+Base URL: `https://YOUR_API_GATEWAY_URL`
 
 | Endpoint | Description |
 |---|---|
-| `GET /alerts` | Paginated alert history |
-| `GET /alerts?threat=0` | Filter by threat type |
-| `GET /alerts?since=2025-01-15T00:00:00Z` | Filter by time |
-| `GET /alerts?limit=50&offset=100` | Pagination |
-| `GET /alerts/latest` | Most recent alert |
 | `GET /status` | WebSocket connection health |
+| `GET /alerts` | Paginated alert history (default 100, max 1000) |
+| `GET /alerts?threat=0` | Filter by threat type |
+| `GET /alerts?since=2026-01-15T00:00:00Z` | Filter by received time |
+| `GET /alerts?limit=50&offset=50` | Pagination |
+| `GET /alerts/latest` | Most recent alert |
 
-### `lambda/handler.py`
+### Alert schema
 
-Thin proxy — forwards requests from the public Function URL to the
-EC2 private IP, injecting the shared auth token.
-
-## Alert schema
-
-Every alert object matches Tzofar's WebSocket payload exactly,
-with one field added:
+Every alert matches Tzofar's WebSocket payload exactly, with `received_at` added:
 
 ```json
 {
@@ -51,7 +56,7 @@ with one field added:
   "threat":      0,
   "isDrill":     false,
   "cities":      ["תל אביב - דרום העיר ויפו", "בת ים"],
-  "received_at": "2025-01-15T14:31:39.123Z"
+  "received_at": "2026-03-15T14:31:39.123Z"
 }
 ```
 
@@ -63,73 +68,89 @@ with one field added:
 | 1 | Unconventional missile |
 | 2 | Earthquake |
 | 3 | Tsunami |
-| 4 | Hostile aircraft / UAV |
+| 4 | Hostile aircraft / UAV infiltration |
 | 5 | Terrorist infiltration |
-| 6 | Hazardous materials |
+| 6 | Hazardous materials incident |
 | 7 | Radiological incident |
-| 8 | Safe to leave shelter |
+| 8 | Safe to leave shelter (all-clear) |
 
-## Setup
+## Deployment
 
-### EC2
+See `docs/HOWTO-PowerShell.pdf` for the full step-by-step guide (Windows PowerShell).
+
+### Infrastructure summary
+
+| Resource | Value |
+|---|---|
+| EC2 instance | `YOUR_INSTANCE_ID` (tzofar-listener) |
+| EC2 type | `t4g.nano`, Amazon Linux 2023 ARM64 |
+| EC2 private IP | `YOUR_EC2_PRIVATE_IP` |
+| EC2 public IP | `YOUR_EC2_PUBLIC_IP` |
+| Region | `il-central-1` (Tel Aviv) |
+| VPC | `YOUR_VPC_ID` |
+| EC2 security group | `tzofar-ec2-sg` |
+| Lambda security group | `tzofar-lambda-sg` |
+| API Gateway | `tzofar-proxy-API` (igzzaecey6) |
+
+### EC2 setup (Amazon Linux 2023)
 
 ```bash
-# 1. Install deps
-sudo apt update && sudo apt install -y python3-pip python3-venv
-sudo mkdir -p /opt/tzofar && sudo chown admin:admin /opt/tzofar
+# Install deps
+sudo mkdir -p /opt/tzofar && sudo chown ec2-user:ec2-user /opt/tzofar
 python3 -m venv /opt/tzofar/venv
 /opt/tzofar/venv/bin/pip install websockets
 
-# 2. Copy files
-cp ec2/listener.py /opt/tzofar/listener.py
-sudo cp ec2/tzofar.service /etc/systemd/system/tzofar.service
+# Download files from repo
+curl -so /opt/tzofar/listener.py \
+  https://raw.githubusercontent.com/panealy/israelalerts/main/ec2/listener.py
+curl -so /tmp/tzofar.service \
+  https://raw.githubusercontent.com/panealy/israelalerts/main/ec2/tzofar.service
+sudo cp /tmp/tzofar.service /etc/systemd/system/tzofar.service
 
-# 3. Set your token in the service file
-sudo nano /etc/systemd/system/tzofar.service
-# Change: Environment="API_TOKEN=CHANGE_ME"
+# Generate and set API token
+TOKEN=$(python3 -c "import secrets; print(secrets.token_hex(32))")
+sudo sed -i "s/CHANGE_ME/$TOKEN/" /etc/systemd/system/tzofar.service
+sudo sed -i 's/User=nobody/User=ec2-user/' /etc/systemd/system/tzofar.service
 
-# 4. Enable and start
-sudo systemctl daemon-reload
-sudo systemctl enable --now tzofar
+# Enable and start
+sudo systemctl daemon-reload && sudo systemctl enable --now tzofar
 sudo journalctl -u tzofar -f
 ```
 
-### Lambda
+### Lambda setup
 
-1. Create function in `il-central-1`, Python 3.12, ARM64
-2. Paste contents of `lambda/handler.py`
+1. Create function in `il-central-1`, Python 3.12, arm64
+2. Upload `lambda/handler.py` as a zip
 3. Set environment variables:
    - `VM_BASE_URL` = `http://YOUR_EC2_PRIVATE_IP:8080`
-   - `API_TOKEN` = same value as in the service file
-4. Attach to VPC, use the `tzofar-lambda-sg` security group
-5. Enable Function URL, auth type: NONE
-6. Set timeout to 15 seconds
+   - `API_TOKEN` = same token set in `tzofar.service`
+4. Attach to VPC, select all subnets, security group: `tzofar-lambda-sg`
+5. Set timeout to 15 seconds
+6. Add trigger: **API Gateway → HTTP API → Security: Open**
 
-## Usage
+### API Gateway route fix
 
-```bash
-LAMBDA="https://YOUR_LAMBDA_FUNCTION_URL"
+The API Gateway trigger creates route `ANY /tzofar-proxy`. You must also add:
 
-# Last 100 alerts
-curl "$LAMBDA/alerts"
-
-# Rocket alerts only
-curl "$LAMBDA/alerts?threat=0"
-
-# Paginate
-curl "$LAMBDA/alerts?limit=50&offset=50"
-
-# Since a specific time
-curl "$LAMBDA/alerts?since=2025-01-15T00:00:00Z"
-
-# Latest single alert
-curl "$LAMBDA/alerts/latest"
-
-# WebSocket connection health
-curl "$LAMBDA/status"
 ```
+ANY /tzofar-proxy/{proxy+}
+```
+
+Attach the same Lambda integration to the new route. The stage has auto-deploy
+enabled so changes are live immediately.
 
 ## Cost
 
-~$18/year (EC2 t4g.nano in il-central-1). Lambda and intra-VPC
-data transfer are effectively free at this data volume.
+~$18/year (EC2 t4g.nano). API Gateway, Lambda, and intra-VPC data transfer
+are effectively free at this data volume (~110 MB/year).
+
+## Files
+
+| File | Purpose |
+|---|---|
+| `ec2/listener.py` | WebSocket listener + HTTP API service |
+| `ec2/tzofar.service` | systemd unit for the listener |
+| `lambda/handler.py` | Lambda proxy function |
+| `docs/openapi.yaml` | OpenAPI 3.0 spec for the API |
+| `docs/HOWTO.pdf` | Deployment guide (bash) |
+| `docs/HOWTO-PowerShell.pdf` | Deployment guide (Windows PowerShell) |

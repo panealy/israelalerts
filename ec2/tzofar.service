@@ -1,0 +1,20 @@
+[Unit]
+Description=Tzofar WebSocket Listener
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=nobody
+WorkingDirectory=/opt/tzofar
+Environment="DB_PATH=/opt/tzofar/alerts.db"
+Environment="API_TOKEN=CHANGE_ME"
+Environment="HTTP_PORT=8080"
+ExecStart=/opt/tzofar/venv/bin/python3 /opt/tzofar/listener.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

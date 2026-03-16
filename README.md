@@ -47,20 +47,61 @@ Base URL: `https://YOUR_API_GATEWAY_URL`
 
 ### Alert schema
 
-Every alert matches Tzofar's WebSocket payload exactly, with `received_at` added:
+All messages are stored with `received_at` added. The `type` field determines the structure.
+
+#### `ALERT` — active siren
+
+Alert details are nested inside the `data` object:
 
 ```json
 {
-  "type":        "ALERT",
-  "time":        1773423099,
-  "threat":      0,
-  "isDrill":     false,
-  "cities":      ["תל אביב - דרום העיר ויפו", "בת ים"],
+  "type": "ALERT",
+  "data": {
+    "notificationId": "2466caa5-2f52-4c14-baf1-4b37002ae324",
+    "time": 1773423099,
+    "threat": 0,
+    "isDrill": false,
+    "cities": ["תל אביב - דרום העיר ויפו", "בת ים"],
+    "citiesIds": [1234, 5678],
+    "areasIds": [6]
+  },
   "received_at": "2026-03-15T14:31:39.123Z"
 }
 ```
 
+#### `SYSTEM_MESSAGE` — two subtypes, distinguished by `data.bodyHe`
+
+**Early warning** (`data.bodyHe` contains `"בדקות הקרובות ייתכן ויופעלו התרעות"`):
+Fired when missile launches are detected before sirens activate. This is the closest
+Tzofar gets to a pre-alert — there is no separate pre-alert message type.
+
+**Exit / all-clear** (`data.bodyHe` contains `"האירוע הסתיים"`):
+Fired when the incident ends.
+
+```json
+{
+  "type": "SYSTEM_MESSAGE",
+  "data": {
+    "id": 821,
+    "time": "1773595110",
+    "titleEn": "Home Front Command - Incident Ended",
+    "bodyEn": "The incident has ended at Ramot Naftali",
+    "titleHe": "...",
+    "bodyHe": "האירוע הסתיים ברמות נפתלי",
+    "titleAr": "...", "bodyAr": "...",
+    "titleRu": "...", "bodyRu": "...",
+    "titleEs": "...", "bodyEs": "...",
+    "citiesIds": [1605],
+    "areasIds": [6]
+  },
+  "received_at": "2026-03-15T17:18:30.888Z"
+}
+```
+
 ### Threat types
+
+Only types 0, 2, 5, and 8 have been observed in practice. Types 1, 3, 4, 6, and 7
+are theoretically valid but have not appeared in Tzofar's historical archive.
 
 | `threat` | Type |
 |---|---|

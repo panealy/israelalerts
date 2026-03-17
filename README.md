@@ -2,15 +2,16 @@
 
 Persistent Israeli emergency alert listener based on the [Tzofar](https://www.tzevaadom.co.il)
 WebSocket feed. Collects all alert messages in real time, stores them to SQLite, and exposes
-a public HTTPS API from outside Israel.
+a public HTTPS REST API and a live WebSocket broadcast stream.
 
-## Live endpoint
+## Live endpoints
 
-```
-https://YOUR_API_GATEWAY_URL
-```
+| Endpoint | Protocol | Purpose |
+|---|---|---|
+| `https://YOUR_API_GATEWAY_URL` | HTTPS | REST API — history, filtering, pagination |
+| `ws://YOUR_EC2_PUBLIC_IP:8082` | WebSocket | Live broadcast — pushed instantly on arrival |
 
-See `docs/openapi.yaml` for the full API spec, or paste it at [editor.swagger.io](https://editor.swagger.io)
+See `docs/openapi.yaml` for the full REST API spec, or paste it at [editor.swagger.io](https://editor.swagger.io)
 for an interactive browser UI.
 
 ## Architecture
@@ -19,37 +20,77 @@ for an interactive browser UI.
 Tzofar WebSocket (wss://ws.tzevaadom.co.il)
         ↓
 EC2 t4g.nano — il-central-1 (Amazon Linux 2023, ARM64)
-  ec2/listener.py — stores to SQLite, HTTP API on :8080 (private)
-        ↑  VPC private IP
+  ec2/listener.py
+    ├── stores to SQLite
+    ├── HTTP API on :8080 (private, VPC only)
+    └── WebSocket broadcast server on :8082 (public, token auth)
+        ↑  VPC private IP (port 8080)
 Lambda (il-central-1, same VPC)
   lambda/handler.py — strips API Gateway prefix, proxies to EC2
         ↑
 API Gateway HTTP API (il-central-1)
         ↑
-Public HTTPS endpoint
+Public HTTPS REST endpoint
 ```
 
 **Note:** AWS Lambda Function URLs are not available in `il-central-1`. API Gateway
-HTTP API is used instead as the public entry point.
+HTTP API is used instead as the public REST entry point.
 
-## API endpoints
+## REST API
 
 Base URL: `https://YOUR_API_GATEWAY_URL`
 
 | Endpoint | Description |
 |---|---|
-| `GET /status` | WebSocket connection health |
+| `GET /status` | WebSocket connection health + connected broadcast client count |
 | `GET /alerts` | Paginated alert history (default 100, max 1000) |
 | `GET /alerts?threat=0` | Filter by threat type |
 | `GET /alerts?since=2026-01-15T00:00:00Z` | Filter by received time |
 | `GET /alerts?limit=50&offset=50` | Pagination |
-| `GET /alerts/latest` | Most recent alert |
+| `GET /alerts/latest` | Most recent alert (bare object, no envelope) |
 
-### Alert schema
+`/alerts` returns `{total, count, offset, limit, alerts[]}`. Use `total` vs `count` to
+detect when more pages exist and paginate with `offset`.
 
-All messages are stored with `received_at` added. The `type` field determines the structure.
+## WebSocket live stream
 
-#### `ALERT` — active siren
+Connect to `ws://YOUR_EC2_PUBLIC_IP:8082` for real-time push delivery. Every Tzofar
+message is broadcast within milliseconds of arrival.
+
+### Auth handshake
+
+```python
+import asyncio, websockets, json
+
+async def listen():
+    async with websockets.connect("ws://YOUR_EC2_PUBLIC_IP:8082") as ws:
+        # Step 1: authenticate
+        await ws.send(json.dumps({"token": "YOUR_API_TOKEN"}))
+
+        # Step 2: wait for confirmation
+        auth = json.loads(await ws.recv())
+        # {"status": "ok", "message": "Authenticated. Listening for live alerts."}
+
+        # Step 3: receive live alerts
+        async for message in ws:
+            alert = json.loads(message)
+            print(alert)
+
+asyncio.run(listen())
+```
+
+### Security note
+
+The WebSocket port is open to the internet, secured by token auth only. Replit and
+similar platforms use rotating outbound IPs, making IP allowlisting impractical. The
+64-character hex token provides strong security. Max 10 simultaneous clients enforced
+server-side.
+
+## Alert schema
+
+All messages include `received_at` (ISO-8601 UTC). The `type` field determines structure.
+
+### `ALERT` — active siren
 
 Alert details are nested inside the `data` object:
 
@@ -69,7 +110,7 @@ Alert details are nested inside the `data` object:
 }
 ```
 
-#### `SYSTEM_MESSAGE` — two subtypes, distinguished by `data.bodyHe`
+### `SYSTEM_MESSAGE` — two subtypes, distinguished by `data.bodyHe`
 
 **Early warning** (`data.bodyHe` contains `"בדקות הקרובות ייתכן ויופעלו התרעות"`):
 Fired when missile launches are detected before sirens activate. This is the closest
@@ -86,8 +127,7 @@ Fired when the incident ends.
     "time": "1773595110",
     "titleEn": "Home Front Command - Incident Ended",
     "bodyEn": "The incident has ended at Ramot Naftali",
-    "titleHe": "...",
-    "bodyHe": "האירוע הסתיים ברמות נפתלי",
+    "titleHe": "...", "bodyHe": "האירוע הסתיים ברמות נפתלי",
     "titleAr": "...", "bodyAr": "...",
     "titleRu": "...", "bodyRu": "...",
     "titleEs": "...", "bodyEs": "...",
@@ -131,7 +171,7 @@ See `docs/HOWTO-PowerShell.pdf` for the full step-by-step guide (Windows PowerSh
 | VPC | `YOUR_VPC_ID` |
 | EC2 security group | `tzofar-ec2-sg` |
 | Lambda security group | `tzofar-lambda-sg` |
-| API Gateway | `tzofar-proxy-API` (igzzaecey6) |
+| API Gateway | `tzofar-proxy-API` |
 
 ### EC2 setup (Amazon Linux 2023)
 
@@ -157,6 +197,21 @@ sudo sed -i 's/User=nobody/User=ec2-user/' /etc/systemd/system/tzofar.service
 sudo systemctl daemon-reload && sudo systemctl enable --now tzofar
 sudo journalctl -u tzofar -f
 ```
+
+Expected startup log:
+```
+[INFO] HTTP API listening on 0.0.0.0:8080
+[INFO] WS broadcast server listening on 0.0.0.0:8082
+[INFO] Connected.
+```
+
+### EC2 security group ports
+
+| Port | Source | Purpose |
+|---|---|---|
+| 22 | EC2 Instance Connect CIDR | SSH (Instance Connect) |
+| 8080 | `tzofar-lambda-sg` | HTTP API (Lambda only) |
+| 8082 | `0.0.0.0/0` | WebSocket broadcast (token auth) |
 
 ### Lambda setup
 
@@ -189,9 +244,9 @@ are effectively free at this data volume (~110 MB/year).
 
 | File | Purpose |
 |---|---|
-| `ec2/listener.py` | WebSocket listener + HTTP API service |
+| `ec2/listener.py` | WebSocket listener + HTTP API + WS broadcast server |
 | `ec2/tzofar.service` | systemd unit for the listener |
 | `lambda/handler.py` | Lambda proxy function |
-| `docs/openapi.yaml` | OpenAPI 3.0 spec for the API |
+| `docs/openapi.yaml` | OpenAPI 3.0 spec for the REST API |
 | `docs/HOWTO.pdf` | Deployment guide (bash) |
 | `docs/HOWTO-PowerShell.pdf` | Deployment guide (Windows PowerShell) |

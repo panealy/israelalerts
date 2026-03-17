@@ -59,6 +59,34 @@ def init_db() -> sqlite3.Connection:
         CREATE INDEX IF NOT EXISTS idx_threat ON alerts (threat)
     """)
     conn.commit()
+
+    # ── Migration: fix rows where threat/cities were stored incorrectly ──────────
+    # Earlier versions read threat/cities from top-level payload instead of data{}.
+    # Re-parse raw JSON for any ALERT rows with null threat to fix indexed columns.
+    bad_rows = conn.execute(
+        "SELECT id, raw FROM alerts WHERE type = 'ALERT' AND threat IS NULL"
+    ).fetchall()
+    if bad_rows:
+        log.info("Migrating %d ALERT rows with missing threat/cities columns...", len(bad_rows))
+        for row_id, raw_json in bad_rows:
+            try:
+                payload = json.loads(raw_json)
+                data    = payload.get("data") or {}
+                conn.execute(
+                    "UPDATE alerts SET threat=?, cities=?, time=?, is_drill=? WHERE id=?",
+                    (
+                        data.get("threat"),
+                        json.dumps(data.get("cities"), ensure_ascii=False) if data.get("cities") else None,
+                        data.get("time"),
+                        int(bool(data.get("isDrill", False))),
+                        row_id,
+                    )
+                )
+            except Exception as e:
+                log.warning("Migration failed for row %d: %s", row_id, e)
+        conn.commit()
+        log.info("Migration complete.")
+
     return conn
 
 # Thread-safe DB connection (created once, shared via lock)
@@ -74,20 +102,37 @@ def get_db() -> sqlite3.Connection:
 def store_alert(payload: dict, received_at: str) -> None:
     """
     Persist one Tzofar WS message.
-    We store every top-level field we know about, plus the full raw JSON.
+    For ALERT messages, fields like threat/cities/time are nested inside data{}.
+    For SYSTEM_MESSAGE/UPDATE, fields are also inside data{}.
+    We index the nested fields for filtering, plus store full raw JSON.
     """
     db = get_db()
-    cities = payload.get("cities") or payload.get("data")
+    data = payload.get("data") or {}
+    msg_type = payload.get("type")
+
+    if msg_type == "ALERT":
+        # ALERT: threat/cities/time/isDrill are inside data{}
+        threat   = data.get("threat")
+        cities   = data.get("cities")
+        time     = data.get("time")
+        is_drill = int(bool(data.get("isDrill", False)))
+    else:
+        # SYSTEM_MESSAGE / UPDATE: time is inside data{}, no threat/cities
+        threat   = None
+        cities   = None
+        time     = data.get("time")
+        is_drill = 0
+
     with _db_lock:
         db.execute("""
             INSERT INTO alerts (received_at, type, time, threat, is_drill, cities, raw)
             VALUES (?, ?, ?, ?, ?, ?, ?)
         """, (
             received_at,
-            payload.get("type"),
-            payload.get("time"),
-            payload.get("threat"),
-            int(bool(payload.get("isDrill", payload.get("is_drill", False)))),
+            msg_type,
+            time,
+            threat,
+            is_drill,
             json.dumps(cities, ensure_ascii=False) if cities is not None else None,
             json.dumps(payload, ensure_ascii=False),
         ))
@@ -187,21 +232,25 @@ class Handler(BaseHTTPRequestHandler):
             threat = qs.get("threat")
             since  = qs.get("since")
 
-            sql    = "SELECT raw, received_at FROM alerts WHERE 1=1"
+            where  = "WHERE 1=1"
             params: list = []
 
             if threat:
-                sql += " AND threat = ?"
+                where += " AND threat = ?"
                 params.append(int(threat[0]))
             if since:
-                sql += " AND received_at >= ?"
+                where += " AND received_at >= ?"
                 params.append(since[0])
 
-            sql += " ORDER BY id DESC LIMIT ? OFFSET ?"
-            params += [limit, offset]
-
             with _db_lock:
-                rows = get_db().execute(sql, params).fetchall()
+                db = get_db()
+                total = db.execute(
+                    f"SELECT COUNT(*) FROM alerts {where}", params
+                ).fetchone()[0]
+                rows = db.execute(
+                    f"SELECT raw, received_at FROM alerts {where} ORDER BY id DESC LIMIT ? OFFSET ?",
+                    params + [limit, offset]
+                ).fetchall()
 
             alerts = []
             for raw_json, received_at in rows:
@@ -212,7 +261,13 @@ class Handler(BaseHTTPRequestHandler):
                 obj["received_at"] = received_at
                 alerts.append(obj)
 
-            self._json({"count": len(alerts), "alerts": alerts})
+            self._json({
+                "total":  total,
+                "count":  len(alerts),
+                "offset": offset,
+                "limit":  limit,
+                "alerts": alerts,
+            })
 
         elif path == "/alerts/latest":
             with _db_lock:

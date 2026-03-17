@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Tzofar WebSocket listener + HTTP API
-Stores alerts in SQLite, schema matches Tzofar WS payload exactly.
+Tzofar WebSocket listener + HTTP API + WebSocket broadcast server
+Stores alerts in SQLite, exposes HTTP API on :8080,
+and broadcasts live alerts to authenticated WebSocket clients on :8082.
 """
 
 import asyncio
@@ -32,8 +33,28 @@ DB_PATH         = os.environ.get("DB_PATH",     "/opt/tzofar/alerts.db")
 API_TOKEN       = os.environ.get("API_TOKEN",   "CHANGE_ME")
 HTTP_HOST       = "0.0.0.0"
 HTTP_PORT       = int(os.environ.get("HTTP_PORT", 8080))
+WS_PORT         = int(os.environ.get("WS_PORT",  8082))
 RECONNECT_DELAY = 5   # seconds between WS reconnect attempts
 MAX_ROWS        = 50_000  # hard cap — trim oldest when exceeded
+MAX_WS_CLIENTS  = 10  # max simultaneous broadcast clients
+
+# ── Broadcast client registry ─────────────────────────────────────────────────
+# Set of authenticated WebSocket connections to broadcast to.
+# Managed entirely within the asyncio event loop.
+_broadcast_clients: set = set()
+_broadcast_loop: asyncio.AbstractEventLoop | None = None
+
+async def broadcast(message: str) -> None:
+    """Send a message to all authenticated broadcast clients."""
+    if not _broadcast_clients:
+        return
+    disconnected = set()
+    for ws in _broadcast_clients.copy():
+        try:
+            await ws.send(message)
+        except Exception:
+            disconnected.add(ws)
+    _broadcast_clients.difference_update(disconnected)
 
 # ── Database ──────────────────────────────────────────────────────────────────
 def init_db() -> sqlite3.Connection:
@@ -43,26 +64,20 @@ def init_db() -> sqlite3.Connection:
     conn.execute("""
         CREATE TABLE IF NOT EXISTS alerts (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            received_at TEXT    NOT NULL,          -- ISO-8601 UTC, added by us
-            type        TEXT,                      -- Tzofar: "ALERT", "UPDATE", etc.
-            time        INTEGER,                   -- Tzofar: unix timestamp of alert
-            threat      INTEGER,                   -- Tzofar: threat category (0=rockets...)
-            is_drill    INTEGER,                   -- Tzofar: boolean as 0/1
-            cities      TEXT,                      -- Tzofar: JSON array of city strings
-            raw         TEXT    NOT NULL           -- full original JSON payload
+            received_at TEXT    NOT NULL,
+            type        TEXT,
+            time        INTEGER,
+            threat      INTEGER,
+            is_drill    INTEGER,
+            cities      TEXT,
+            raw         TEXT    NOT NULL
         )
     """)
-    conn.execute("""
-        CREATE INDEX IF NOT EXISTS idx_received_at ON alerts (received_at)
-    """)
-    conn.execute("""
-        CREATE INDEX IF NOT EXISTS idx_threat ON alerts (threat)
-    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_received_at ON alerts (received_at)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_threat ON alerts (threat)")
     conn.commit()
 
-    # ── Migration: fix rows where threat/cities were stored incorrectly ──────────
-    # Earlier versions read threat/cities from top-level payload instead of data{}.
-    # Re-parse raw JSON for any ALERT rows with null threat to fix indexed columns.
+    # Migration: fix rows where threat/cities were stored incorrectly
     bad_rows = conn.execute(
         "SELECT id, raw FROM alerts WHERE type = 'ALERT' AND threat IS NULL"
     ).fetchall()
@@ -89,9 +104,8 @@ def init_db() -> sqlite3.Connection:
 
     return conn
 
-# Thread-safe DB connection (created once, shared via lock)
 _db_lock = threading.Lock()
-_db = None  # sqlite3.Connection or None
+_db = None
 
 def get_db() -> sqlite3.Connection:
     global _db
@@ -100,24 +114,16 @@ def get_db() -> sqlite3.Connection:
     return _db
 
 def store_alert(payload: dict, received_at: str) -> None:
-    """
-    Persist one Tzofar WS message.
-    For ALERT messages, fields like threat/cities/time are nested inside data{}.
-    For SYSTEM_MESSAGE/UPDATE, fields are also inside data{}.
-    We index the nested fields for filtering, plus store full raw JSON.
-    """
     db = get_db()
     data = payload.get("data") or {}
     msg_type = payload.get("type")
 
     if msg_type == "ALERT":
-        # ALERT: threat/cities/time/isDrill are inside data{}
         threat   = data.get("threat")
         cities   = data.get("cities")
         time     = data.get("time")
         is_drill = int(bool(data.get("isDrill", False)))
     else:
-        # SYSTEM_MESSAGE / UPDATE: time is inside data{}, no threat/cities
         threat   = None
         cities   = None
         time     = data.get("time")
@@ -137,7 +143,6 @@ def store_alert(payload: dict, received_at: str) -> None:
             json.dumps(payload, ensure_ascii=False),
         ))
         db.commit()
-        # Trim to MAX_ROWS
         db.execute("""
             DELETE FROM alerts WHERE id IN (
                 SELECT id FROM alerts ORDER BY id ASC
@@ -146,7 +151,7 @@ def store_alert(payload: dict, received_at: str) -> None:
         """, (MAX_ROWS,))
         db.commit()
 
-# ── WebSocket listener ────────────────────────────────────────────────────────
+# ── Tzofar WebSocket listener ─────────────────────────────────────────────────
 connection_status = {
     "connected":    False,
     "last_message": None,
@@ -155,6 +160,9 @@ connection_status = {
 }
 
 async def listen_forever() -> None:
+    global _broadcast_loop
+    _broadcast_loop = asyncio.get_running_loop()
+
     while True:
         try:
             log.info("Connecting to Tzofar WebSocket...")
@@ -180,6 +188,9 @@ async def listen_forever() -> None:
 
                     log.info("Message: %s", json.dumps(payload)[:200])
                     store_alert(payload, received_at)
+                    # Broadcast to live WebSocket clients
+                    msg = json.dumps({**payload, "received_at": received_at}, ensure_ascii=False)
+                    await broadcast(msg)
 
         except Exception as exc:
             connection_status["connected"] = False
@@ -190,11 +201,65 @@ async def listen_forever() -> None:
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
-def start_ws_thread() -> None:
-    def run():
-        asyncio.run(listen_forever())
-    t = threading.Thread(target=run, daemon=True)
-    t.start()
+# ── WebSocket broadcast server ────────────────────────────────────────────────
+async def handle_broadcast_client(ws) -> None:
+    """
+    Authenticate then stream live Tzofar messages to a client.
+
+    Auth handshake:
+      Client sends:  {"token": "YOUR_API_TOKEN"}
+      Server sends:  {"status": "ok"}  -- then live messages follow
+                 or: {"status": "error", "message": "..."}  -- then disconnects
+    """
+    remote = ws.remote_address
+    log.info("WS broadcast: new connection from %s", remote)
+
+    if len(_broadcast_clients) >= MAX_WS_CLIENTS:
+        await ws.send(json.dumps({"status": "error", "message": "Too many clients"}))
+        await ws.close()
+        log.warning("WS broadcast: rejected %s (max clients)", remote)
+        return
+
+    # Wait for auth message (5 second timeout)
+    try:
+        auth_raw = await asyncio.wait_for(ws.recv(), timeout=5.0)
+        auth = json.loads(auth_raw)
+        if auth.get("token") != API_TOKEN:
+            await ws.send(json.dumps({"status": "error", "message": "Unauthorized"}))
+            await ws.close()
+            log.warning("WS broadcast: rejected %s (bad token)", remote)
+            return
+    except asyncio.TimeoutError:
+        await ws.send(json.dumps({"status": "error", "message": "Auth timeout"}))
+        await ws.close()
+        return
+    except Exception as e:
+        await ws.send(json.dumps({"status": "error", "message": str(e)}))
+        await ws.close()
+        return
+
+    # Auth OK — add to broadcast set
+    await ws.send(json.dumps({"status": "ok", "message": "Authenticated. Listening for live alerts."}))
+    _broadcast_clients.add(ws)
+    log.info("WS broadcast: %s authenticated (%d clients)", remote, len(_broadcast_clients))
+
+    try:
+        # Keep connection alive until client disconnects
+        await ws.wait_closed()
+    finally:
+        _broadcast_clients.discard(ws)
+        log.info("WS broadcast: %s disconnected (%d clients)", remote, len(_broadcast_clients))
+
+async def run_broadcast_server() -> None:
+    async with websockets.serve(handle_broadcast_client, "0.0.0.0", WS_PORT):
+        log.info("WS broadcast server listening on 0.0.0.0:%d", WS_PORT)
+        await asyncio.Future()  # run forever
+
+async def main_async() -> None:
+    await asyncio.gather(
+        listen_forever(),
+        run_broadcast_server(),
+    )
 
 # ── HTTP API ──────────────────────────────────────────────────────────────────
 class Handler(BaseHTTPRequestHandler):
@@ -224,7 +289,10 @@ class Handler(BaseHTTPRequestHandler):
         path   = parsed.path
 
         if path == "/status":
-            self._json(connection_status)
+            self._json({
+                **connection_status,
+                "ws_broadcast_clients": len(_broadcast_clients),
+            })
 
         elif path == "/alerts":
             limit  = min(int(qs.get("limit",  [100])[0]), 1000)
@@ -288,8 +356,15 @@ class Handler(BaseHTTPRequestHandler):
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("Starting Tzofar listener  db=%s  port=%d", DB_PATH, HTTP_PORT)
-    start_ws_thread()
+    log.info("Starting Tzofar listener  db=%s  port=%d  ws_port=%d",
+             DB_PATH, HTTP_PORT, WS_PORT)
+
+    # Run HTTP server in its own thread
+    get_db()  # init DB + migration on startup
     server = HTTPServer((HTTP_HOST, HTTP_PORT), Handler)
+    http_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    http_thread.start()
     log.info("HTTP API listening on %s:%d", HTTP_HOST, HTTP_PORT)
-    server.serve_forever()
+
+    # Run Tzofar listener + WS broadcast server together in asyncio
+    asyncio.run(main_async())

@@ -42,7 +42,7 @@ MAX_WS_CLIENTS  = 10  # max simultaneous broadcast clients
 # Set of authenticated WebSocket connections to broadcast to.
 # Managed entirely within the asyncio event loop.
 _broadcast_clients: set = set()
-_broadcast_loop: asyncio.AbstractEventLoop | None = None
+_broadcast_loop = None  # asyncio.AbstractEventLoop or None
 
 async def broadcast(message: str) -> None:
     """Send a message to all authenticated broadcast clients."""
@@ -180,11 +180,16 @@ async def listen_forever() -> None:
                     received_at = _now()
                     connection_status["last_message"] = received_at
 
+                    # Handle binary frames from Tzofar (ping/keepalive)
+                    if isinstance(raw, bytes):
+                        log.debug("Binary frame ignored (%d bytes)", len(raw))
+                        continue
+
                     try:
                         payload = json.loads(raw)
                     except json.JSONDecodeError:
                         log.warning("Non-JSON frame: %s", raw[:200])
-                        payload = {"raw_text": raw}
+                        continue
 
                     log.info("Message: %s", json.dumps(payload)[:200])
                     store_alert(payload, received_at)
